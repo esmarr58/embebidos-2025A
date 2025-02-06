@@ -1,3 +1,5 @@
+//espidf v6.10  - Compilado el 5 de Febrero 2025
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
