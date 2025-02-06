@@ -1,3 +1,4 @@
+//espidf v6.10  - Compilado el 5 de Febrero 2025
 #include <unistd.h>
 #include "sdkconfig.h"
 #include "driver/gpio.h"
