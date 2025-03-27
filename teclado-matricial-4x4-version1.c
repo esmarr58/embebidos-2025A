@@ -5,16 +5,17 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 
-// Definición de las filas y columnas del teclado
-#define ROW1 13   // Pin para la fila 1
-#define ROW2 11   // Pin para la fila 2
-#define ROW3 10   // Pin para la fila 3
-#define ROW4 9    // Pin para la fila 4
+// Pines de filas
+#define ROW1 14
+#define ROW2 13
+#define ROW3 12
+#define ROW4 11
 
-#define COL1 19   // Pin para la columna 1
-#define COL2 20   // Pin para la columna 2
-#define COL3 21   // Pin para la columna 3
-#define COL4 47   // Pin para la columna 4
+// Pines de columnas
+#define COL1 10
+#define COL2 9
+#define COL3 46
+#define COL4 3
 
 volatile int tiempoRetardo = 10;
 
