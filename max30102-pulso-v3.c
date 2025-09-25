@@ -11,21 +11,23 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-// ===================== Configuración OPTIMIZADA =====================
+// ===================== Configuración =====================
 // I2C en ESP32-S3
 #define I2C_SCL_IO              9
 #define I2C_SDA_IO              10
-#define I2C_FREQ_HZ             400000    // 400 kHz estable
+#define I2C_FREQ_HZ             400000    // 400 kHz
 
-// UART0 ALTA VELOCIDAD - ¡IMPORTANTE!
-#define UART0_BAUD              3000000   // 3 Mbps para Serial Plotter
+// UART0 ALTA VELOCIDAD
+#define UART0_BAUD              2000000   // 2 Mbps para Serial Plotter
 
 // MAX30102
 #define MAX30102_ADDR           0x57
 
-// ===================== Configuración FFT OPTIMIZADA =====================
-#define FFT_SIZE                64        // Reducido para mayor velocidad
-#define SAMPLE_RATE_HZ          100.0f
+// ===================== FFT / BPM =====================
+// Muestreamos el MAX30102 a 50 Hz y decimamos a 25 Hz para la FFT
+#define SENSOR_SR_HZ            50.0f
+#define FFT_SR_HZ               25.0f       // después del decimado
+#define FFT_SIZE                512         // ~20.48 s de ventana
 #define BPM_MIN                 40
 #define BPM_MAX                 180
 
@@ -49,13 +51,19 @@
 // ===================== Bits/campos =====================
 #define MODE_RESET_BIT          (1<<6)
 #define MODE_HEART_RATE         0x02
+
+// enable bits (usados en enable y status: coinciden en posición)
 #define INTR_A_FULL_EN          (1<<7)
 #define INTR_PPG_RDY_EN         (1<<6)
+
 #define FIFO_AVG_4              (2<<5)
 #define FIFO_ROLLOVER_EN        (1<<4)
 #define FIFO_A_FULL(n)          ((n)&0x0F)
+
+// SPO2_CONFIG
 #define SPO2_ADC_RANGE_4096     (1<<5)
-#define SPO2_SR_100HZ           (1<<2)
+// SR bits (4:2). 50 Hz = 0b000 << 2, 100 Hz = 0b001 << 2
+#define SPO2_SR_50HZ            (0<<2)
 #define SPO2_PW_411US           (3<<0)
 
 // ===================== Handles =====================
@@ -63,16 +71,19 @@ static const char *TAG = "HR_FFT_FAST";
 static i2c_master_bus_handle_t i2c_bus = NULL;
 static i2c_master_dev_handle_t i2c_dev = NULL;
 
-// ===================== Estructuras FFT OPTIMIZADAS =====================
+// ===================== Estructuras FFT =====================
 typedef struct { float real, imag; } complex_t;
 
-static float fft_samples[FFT_SIZE];
+static float   ds_samples[FFT_SIZE];      // muestras decimadas (25 Hz)
 static complex_t fft_buffer[FFT_SIZE];
-static int sample_count = 0;
-static uint32_t last_fft_time = 0;
-static float current_bpm = 0.0f;
 
-// Filtro paso alto optimizado
+static int    ds_count = 0;               // cuántas muestras decimadas tenemos
+static int    decim_phase = 0;            // para decimar 50 -> 25 Hz (factor 2)
+static float  decim_acc = 0.0f;           // acumulador para promedio simple
+static float  current_bpm = 0.0f;
+static uint32_t last_fft_time = 0;
+
+// Filtro paso alto simple (puedes cambiar a pasabanda si lo prefieres)
 static float hp_prev_input = 0.0f, hp_prev_output = 0.0f;
 static const float hp_a1 = -0.9682458366f;
 static const float hp_b0 = 0.9841229183f;
@@ -80,104 +91,112 @@ static const float hp_b1 = -0.9841229183f;
 
 static inline float highpass_filter(float input) {
     float output = hp_b0 * input + hp_b1 * hp_prev_input - hp_a1 * hp_prev_output;
-    hp_prev_input = input;
+    hp_prev_input  = input;
     hp_prev_output = output;
     return output;
 }
 
-// ===================== FFT OPTIMIZADA =====================
+// ===================== FFT recursiva sencilla =====================
 static void fft(complex_t *x, int n) {
     if (n <= 1) return;
-    
     complex_t even[n/2], odd[n/2];
-    for (int i = 0; i < n/2; i++) {
-        even[i] = x[i*2];
-        odd[i] = x[i*2 + 1];
-    }
-    
+    for (int i = 0; i < n/2; i++) { even[i] = x[i*2]; odd[i] = x[i*2+1]; }
     fft(even, n/2);
-    fft(odd, n/2);
-    
+    fft(odd,  n/2);
     for (int k = 0; k < n/2; k++) {
         float angle = -2 * M_PI * k / n;
-        complex_t t = {
-            cosf(angle) * odd[k].real - sinf(angle) * odd[k].imag,
-            cosf(angle) * odd[k].imag + sinf(angle) * odd[k].real
-        };
-        
-        x[k].real = even[k].real + t.real;
-        x[k].imag = even[k].imag + t.imag;
-        x[k + n/2].real = even[k].real - t.real;
-        x[k + n/2].imag = even[k].imag - t.imag;
+        float ca = cosf(angle), sa = sinf(angle);
+        complex_t t = { ca*odd[k].real - sa*odd[k].imag,
+                        ca*odd[k].imag + sa*odd[k].real };
+        x[k].real        = even[k].real + t.real;
+        x[k].imag        = even[k].imag + t.imag;
+        x[k+n/2].real    = even[k].real - t.real;
+        x[k+n/2].imag    = even[k].imag - t.imag;
     }
+}
+
+// Interpolación parabólica del pico para sub-bin
+static inline float quadratic_peak_offset(float m1, float m0, float p1) {
+    // devuelve desplazamiento en bins en [-0.5, 0.5] aprox
+    float denom = (m1 - 2.0f*m0 + p1);
+    if (fabsf(denom) < 1e-12f) return 0.0f;
+    return 0.5f * (m1 - p1) / denom;
 }
 
 static float calculate_bpm_from_fft(void) {
-    // Aplicar ventana y preparar FFT
+    // Ventana Hann y preparar FFT
     for (int i = 0; i < FFT_SIZE; i++) {
-        float window = 0.5f * (1.0f - cosf(2 * M_PI * i / (FFT_SIZE - 1)));
-        fft_buffer[i].real = fft_samples[i] * window;
-        fft_buffer[i].imag = 0;
+        float w = 0.5f * (1.0f - cosf(2.0f * M_PI * i / (FFT_SIZE - 1)));
+        fft_buffer[i].real = ds_samples[i] * w;
+        fft_buffer[i].imag = 0.0f;
     }
-    
+
     fft(fft_buffer, FFT_SIZE);
-    
-    // Buscar pico en rango cardíaco
-    int min_bin = (int)(BPM_MIN / 60.0f * FFT_SIZE / SAMPLE_RATE_HZ);
-    int max_bin = (int)(BPM_MAX / 60.0f * FFT_SIZE / SAMPLE_RATE_HZ);
+
+    // Rango de búsqueda 40–180 BPM
+    int min_bin = (int)floorf((BPM_MIN/60.0f) * FFT_SIZE / FFT_SR_HZ);
+    int max_bin = (int)ceilf ((BPM_MAX/60.0f) * FFT_SIZE / FFT_SR_HZ);
     if (min_bin < 1) min_bin = 1;
-    if (max_bin >= FFT_SIZE/2) max_bin = FFT_SIZE/2 - 1;
-    
-    float max_mag = 0;
-    int peak_bin = min_bin;
-    
-    for (int i = min_bin; i <= max_bin; i++) {
-        float mag = sqrtf(fft_buffer[i].real * fft_buffer[i].real + 
-                         fft_buffer[i].imag * fft_buffer[i].imag);
-        if (mag > max_mag) {
-            max_mag = mag;
-            peak_bin = i;
-        }
+    if (max_bin >= (FFT_SIZE/2 - 1)) max_bin = (FFT_SIZE/2 - 2); // dejamos margen para k+1
+
+    // Magnitud y búsqueda de pico
+    float max_mag = 0.0f;
+    int   k_peak  = min_bin;
+
+    // guardamos magnitudes en el rango para interpolar después
+    // (para ahorrar RAM, calculamos al vuelo)
+    for (int k = min_bin; k <= max_bin; k++) {
+        float re = fft_buffer[k].real;
+        float im = fft_buffer[k].imag;
+        float mag = sqrtf(re*re + im*im);
+        if (mag > max_mag) { max_mag = mag; k_peak = k; }
     }
-    
-    float bpm = (float)peak_bin * SAMPLE_RATE_HZ * 60.0f / FFT_SIZE;
+
+    // Interpolación parabólica alrededor del pico
+    float m1=0, m0=0, p1=0;
+    {
+        int km1 = k_peak - 1;
+        int kp1 = k_peak + 1;
+        float re, im;
+
+        re = fft_buffer[km1].real; im = fft_buffer[km1].imag; m1 = sqrtf(re*re + im*im);
+        re = fft_buffer[k_peak].real; im = fft_buffer[k_peak].imag; m0 = sqrtf(re*re + im*im);
+        re = fft_buffer[kp1].real; im = fft_buffer[kp1].imag; p1 = sqrtf(re*re + im*im);
+    }
+    float delta = quadratic_peak_offset(m1, m0, p1);       // sub-bin
+    float peak_bin_f = (float)k_peak + delta;
+    float bpm = peak_bin_f * FFT_SR_HZ * 60.0f / (float)FFT_SIZE;
+
     return (bpm >= BPM_MIN && bpm <= BPM_MAX) ? bpm : 0.0f;
 }
 
-// ===================== UART0 ALTA VELOCIDAD =====================
+// ===================== UART0 =====================
 static void uart0_setup(uint32_t baud) {
     const uart_port_t uart_num = UART_NUM_0;
-
-    // Configuración optimizada para alta velocidad
     uart_config_t cfg = {
         .baud_rate = (int)baud,
         .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
+        .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+        .source_clk= UART_SCLK_DEFAULT,
     };
-    
     ESP_ERROR_CHECK(uart_param_config(uart_num, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(uart_num, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    
-    // Buffer más grande para alta velocidad
-    ESP_ERROR_CHECK(uart_driver_install(uart_num, 2048, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(uart_num, 4096, 0, 0, NULL, 0));
     esp_vfs_dev_uart_use_driver(uart_num);
-
-    // Buffer de línea más eficiente
     setvbuf(stdout, NULL, _IOLBF, 0);
 }
 
-// ===================== I2C helpers (igual que antes) =====================
+// ===================== I2C helpers =====================
 static esp_err_t i2c_init_bus(void) {
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
         .sda_io_num = I2C_SDA_IO,
         .scl_io_num = I2C_SCL_IO,
         .clk_source = I2C_CLK_SRC_DEFAULT,
-        .flags = { .enable_internal_pullup = 1 },
+        .flags = { .enable_internal_pullup = 1 }, // Recomendado usar pull-ups externos a 400kHz
     };
     return i2c_new_master_bus(&bus_cfg, &i2c_bus);
 }
@@ -199,7 +218,7 @@ static inline esp_err_t reg_write(uint8_t reg, uint8_t val) {
     return i2c_master_transmit(i2c_dev, buf, sizeof(buf), 1000);
 }
 
-// ===================== MAX30102 functions (igual) =====================
+// ===================== MAX30102 =====================
 static esp_err_t max30102_reset(void) {
     ESP_RETURN_ON_ERROR(reg_write(REG_MODE_CONFIG, MODE_RESET_BIT), TAG, "RESET");
     for (int i = 0; i < 50; ++i) {
@@ -227,22 +246,31 @@ static uint8_t fifo_level(void) {
 
 static esp_err_t max30102_init_hr(void) {
     ESP_RETURN_ON_ERROR(max30102_reset(), TAG, "reset");
+
+    // FIFO: promedio x4, rollover, A_FULL=8
     uint8_t fifo_cfg = FIFO_AVG_4 | FIFO_ROLLOVER_EN | FIFO_A_FULL(8);
     ESP_RETURN_ON_ERROR(reg_write(REG_FIFO_CONFIG, fifo_cfg), TAG, "FIFO_CONFIG");
+
+    // Modo HR (LED rojo)
     ESP_RETURN_ON_ERROR(reg_write(REG_MODE_CONFIG, MODE_HEART_RATE), TAG, "MODE_HR");
-    
-    uint8_t spo2_cfg = SPO2_ADC_RANGE_4096 | SPO2_SR_100HZ | SPO2_PW_411US;
+
+    // SPO2: rango 4096nA, SR=50Hz, PW=411us (18 bits)
+    uint8_t spo2_cfg = SPO2_ADC_RANGE_4096 | SPO2_SR_50HZ | SPO2_PW_411US;
     ESP_RETURN_ON_ERROR(reg_write(REG_SPO2_CONFIG, spo2_cfg), TAG, "SPO2_CONFIG");
-    ESP_RETURN_ON_ERROR(reg_write(REG_LED1_PA, 0x24), TAG, "LED1 Red");
+
+    // LED intensidades: subir rojo para que sea visible
+    ESP_RETURN_ON_ERROR(reg_write(REG_LED1_PA, 0x60), TAG, "LED1 Red"); // brillo alto
     ESP_RETURN_ON_ERROR(reg_write(REG_LED2_PA, 0x00), TAG, "LED2 Off");
+
+    // Interrupciones: PPG_RDY y A_FULL
     ESP_RETURN_ON_ERROR(reg_write(REG_INTR_ENABLE_1, INTR_PPG_RDY_EN | INTR_A_FULL_EN), TAG, "INTR1");
     ESP_RETURN_ON_ERROR(reg_write(REG_INTR_ENABLE_2, 0x00), TAG, "INTR2");
-    
-    // Limpiar interrupciones
+
+    // Limpiar interrupciones pendientes
     uint8_t d;
     (void)reg_read(REG_INTR_STATUS_1, &d, 1);
     (void)reg_read(REG_INTR_STATUS_2, &d, 1);
-    
+
     ESP_RETURN_ON_ERROR(fifo_clear(), TAG, "FIFO clr");
     return ESP_OK;
 }
@@ -255,7 +283,7 @@ static inline bool read_sample_one(uint32_t *val) {
     return true;
 }
 
-// ===================== app_main OPTIMIZADO =====================
+// ===================== app_main =====================
 void app_main(void) {
     esp_log_level_set("*", ESP_LOG_WARN);
     uart0_setup(UART0_BAUD);
@@ -283,46 +311,67 @@ void app_main(void) {
     }
 
     printf("Iniciando medición BPM @ %d bauds\r\n", UART0_BAUD);
-    printf("FFT_SIZE:%d, Esperando %.1fs para primera lectura...\r\n", 
-           FFT_SIZE, (float)FFT_SIZE/SAMPLE_RATE_HZ);
+    printf("SENSOR_SR:%.0f Hz, FFT_SR:%.0f Hz, FFT_SIZE:%d (~%.2fs ventana)\r\n",
+           SENSOR_SR_HZ, FFT_SR_HZ, FFT_SIZE, (float)FFT_SIZE/FFT_SR_HZ);
 
-    // Buffer optimizado para serial
-    char line[32];
-    
+    uint32_t last_print_t = 0;
+
     while (1) {
         uint8_t s1 = 0;
         if (reg_read(REG_INTR_STATUS_1, &s1, 1) != ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
         if (s1 & (INTR_PPG_RDY_EN | INTR_A_FULL_EN)) {
             uint8_t n = fifo_level();
             if (n == 0) n = 1;
-            if (n > 8) n = 8; // Más conservador para alta velocidad
+            if (n > 8) n = 8; // margen
 
             for (uint8_t k = 0; k < n; ++k) {
                 uint32_t ppg_raw = 0;
                 if (!read_sample_one(&ppg_raw)) break;
-                
+
+                // Filtro básico
                 float filtered = highpass_filter((float)ppg_raw);
-                
-                if (sample_count < FFT_SIZE) {
-                    fft_samples[sample_count++] = filtered;
+
+                // Decimado por 2 (promedio simple 2:1)
+                decim_acc += filtered;
+                decim_phase++;
+                if (decim_phase >= 2) {
+                    float ds_val = decim_acc * 0.5f;  // promedio 2:1
+                    decim_acc = 0.0f;
+                    decim_phase = 0;
+
+                    // Acumular para FFT
+                    if (ds_count < FFT_SIZE) {
+                        ds_samples[ds_count++] = ds_val;
+                    }
+
+                    // Emitir PPG decimado para plotter (opcional)
+                    printf("PPG:%d\r\n", (int)(ds_val * 10.0f));
                 }
-                
-                // Serial más eficiente - menos prints
-                printf("PPG:%d\r\n", (int)(filtered * 10.0f));
             }
-            
-            uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (sample_count >= FFT_SIZE && (current_time - last_fft_time) > 1500) {
+
+            // Cada ~5 s si tenemos ventana completa (traslape 50%)
+            uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            bool have_window = (ds_count >= FFT_SIZE);
+            bool time_ok     = (now_ms - last_fft_time) > 5000;  // ~5 s
+
+            if (have_window && time_ok) {
                 current_bpm = calculate_bpm_from_fft();
                 printf("BPM:%.1f\r\n", (current_bpm > 0) ? current_bpm : 0.0f);
-                sample_count = 0;
-                last_fft_time = current_time;
+
+                // Traslape 50%: mueve últimos 256 al inicio
+                for (int i = 0; i < FFT_SIZE/2; ++i) {
+                    ds_samples[i] = ds_samples[i + FFT_SIZE/2];
+                }
+                ds_count = FFT_SIZE/2;
+                last_fft_time = now_ms;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(3)); // Ligeramente más rápido
+
+        // Pequeño respiro
+        vTaskDelay(pdMS_TO_TICKS(3));
     }
 }
