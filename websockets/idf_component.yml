@@ -1,0 +1,4 @@
+# src/idf_component.yml
+dependencies:
+  espressif/mdns: "^1.0.8"
+  espressif/led_strip: "^2.0.0"
