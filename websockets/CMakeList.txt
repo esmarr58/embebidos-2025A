@@ -1,0 +1,19 @@
+# src/CMakeLists.txt
+idf_component_register(
+  SRCS
+    "main.c"
+  INCLUDE_DIRS
+    "."
+  REQUIRES
+    esp_wifi
+    esp_event
+    nvs_flash
+    esp_netif
+    esp_http_server
+    json
+    esp_timer
+    esp_adc          # adc_oneshot*
+    led_strip        # led_strip.h
+    esp_driver_rmt   # si incluyes "driver/rmt_tx.h"
+    mdns             # mDNS oficial (lo trae el manager del paso #1)
+)
