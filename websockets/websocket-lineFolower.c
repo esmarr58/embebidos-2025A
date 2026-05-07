@@ -181,11 +181,28 @@ static inline void mover_retroceder(void)    { motorA_atras();    motorB_atras()
 static inline void mover_izquierda(void)     { motorA_atras();    motorB_adelante(); }
 static inline void mover_derecha(void)       { motorA_adelante(); motorB_atras();    }
 
+
 // Cola/task de motores
 typedef enum {
     Dir_Parado = 0, Dir_Avanzar, Dir_Retroceder, Dir_Izquierda, Dir_Derecha, Dir_Parar
 } DirMov;
 
+typedef enum {
+    EST_LINEA_PARADO = 0,
+    EST_LINEA_AVANZAR,
+    EST_LINEA_RETROCEDER,
+    EST_LINEA_IZQUIERDA,
+    EST_LINEA_DERECHA
+} EstadoLinea;
+
+static volatile bool siguelineas_auto = false;
+static EstadoLinea decidir_estado_linea(int a1, int a2, int a3, int a4);
+
+static uint32_t tiempo_estado_ms     = 1000;
+static uint32_t tiempo_avanzar_ms    = 100;
+static uint32_t tiempo_retroceder_ms = 100;
+static uint32_t tiempo_izquierda_ms  = 50;
+static uint32_t tiempo_derecha_ms    = 50;
 
 typedef struct {
     DirMov accion;
@@ -429,6 +446,10 @@ static esp_err_t ws_handler(httpd_req_t *req) {
                     send_json_to_fd(fd, ack);
                     cJSON_Delete(ack);
                 } else if (tipo && strcmp(tipo, "mover") == 0) {
+
+
+                    siguelineas_auto = false;
+
                     const char *accionStr = cJSON_GetStringValue(cJSON_GetObjectItem(root, "accion"));
                     int ms = cJSON_GetNumberValue(cJSON_GetObjectItem(root, "ms"));
                     if (ms <= 0) ms = 600;
@@ -462,7 +483,54 @@ static esp_err_t ws_handler(httpd_req_t *req) {
                         cJSON_AddNumberToObject(resp, "a4", a4);
                         send_json_to_fd(fd, resp);
                         cJSON_Delete(resp);
-                 }    
+                 }   
+                 else if (tipo && strcmp(tipo, "siguelineas_auto") == 0) {
+                    bool activo = cJSON_IsTrue(cJSON_GetObjectItem(root, "activo"));
+
+                    siguelineas_auto = activo;
+
+                    if (!activo) {
+                        CmdMotor cmd = {
+                            .accion = Dir_Parar,
+                            .dur_ms = 0,
+                            .t0_ms = 0
+                        };
+
+                        if (motorCmdQ) {
+                            xQueueSend(motorCmdQ, &cmd, 0);
+                        }
+                    }
+
+                    cJSON *resp = cJSON_CreateObject();
+                    cJSON_AddStringToObject(resp, "tipo", "siguelineas_auto_ack");
+                    cJSON_AddBoolToObject(resp, "activo", siguelineas_auto);
+                    send_json_to_fd(fd, resp);
+                    cJSON_Delete(resp);
+                }
+                else if (tipo && strcmp(tipo, "siguelineas_config") == 0) {
+                        int t_estado = cJSON_GetNumberValue(cJSON_GetObjectItem(root, "tiempo_estado"));
+                        int t_avanzar = cJSON_GetNumberValue(cJSON_GetObjectItem(root, "avanzar"));
+                        int t_retroceder = cJSON_GetNumberValue(cJSON_GetObjectItem(root, "retroceder"));
+                        int t_izquierda = cJSON_GetNumberValue(cJSON_GetObjectItem(root, "izquierda"));
+                        int t_derecha = cJSON_GetNumberValue(cJSON_GetObjectItem(root, "derecha"));
+
+                        if (t_estado > 50)      tiempo_estado_ms = t_estado;
+                        if (t_avanzar > 0)      tiempo_avanzar_ms = t_avanzar;
+                        if (t_retroceder > 0)   tiempo_retroceder_ms = t_retroceder;
+                        if (t_izquierda > 0)    tiempo_izquierda_ms = t_izquierda;
+                        if (t_derecha > 0)      tiempo_derecha_ms = t_derecha;
+
+                        cJSON *resp = cJSON_CreateObject();
+                        cJSON_AddStringToObject(resp, "tipo", "siguelineas_config_ack");
+                        cJSON_AddNumberToObject(resp, "tiempo_estado", tiempo_estado_ms);
+                        cJSON_AddNumberToObject(resp, "avanzar", tiempo_avanzar_ms);
+                        cJSON_AddNumberToObject(resp, "retroceder", tiempo_retroceder_ms);
+                        cJSON_AddNumberToObject(resp, "izquierda", tiempo_izquierda_ms);
+                        cJSON_AddNumberToObject(resp, "derecha", tiempo_derecha_ms);
+                        send_json_to_fd(fd, resp);
+                        cJSON_Delete(resp);
+                    }
+
                                     
                 cJSON_Delete(root);
             }
@@ -528,6 +596,129 @@ static void leer_siguelineas(int *a1, int *a2, int *a3, int *a4) {
     *a2 = gpio_get_level(S2);
     *a3 = gpio_get_level(S3);
     *a4 = gpio_get_level(S4);
+}
+
+static EstadoLinea decidir_estado_linea(int a1, int a2, int a3, int a4) {
+    /*
+        Suposición típica:
+        0 = detecta línea negra
+        1 = fondo blanco
+
+        Sensores:
+        a1 = izquierda extrema
+        a2 = izquierda centro
+        a3 = derecha centro
+        a4 = derecha extrema
+    */
+
+    // Línea centrada
+    if (a2 == 0 && a3 == 0) {
+        return EST_LINEA_AVANZAR;
+    }
+
+    // Línea hacia la izquierda
+    if (a1 == 0 || a2 == 0) {
+        return EST_LINEA_IZQUIERDA;
+    }
+
+    // Línea hacia la derecha
+    if (a3 == 0 || a4 == 0) {
+        return EST_LINEA_DERECHA;
+    }
+
+    // Línea perdida
+    if (a1 == 1 && a2 == 1 && a3 == 1 && a4 == 1) {
+        return EST_LINEA_RETROCEDER;
+    }
+
+    return EST_LINEA_PARADO;
+}
+static const char* estado_linea_str(EstadoLinea estado) {
+    switch (estado) {
+        case EST_LINEA_AVANZAR:
+            return "avanzar";
+
+        case EST_LINEA_RETROCEDER:
+            return "retroceder";
+
+        case EST_LINEA_IZQUIERDA:
+            return "izquierda";
+
+        case EST_LINEA_DERECHA:
+            return "derecha";
+
+        default:
+            return "parado";
+    }
+}
+
+void LineaTask(void *arg) {
+    EstadoLinea ultimo_estado = EST_LINEA_PARADO;
+
+    for (;;) {
+        if (siguelineas_auto) {
+            int a1, a2, a3, a4;
+            leer_siguelineas(&a1, &a2, &a3, &a4);
+
+            EstadoLinea estado = decidir_estado_linea(a1, a2, a3, a4);
+
+            if (estado != ultimo_estado) {
+                ultimo_estado = estado;
+
+                CmdMotor cmd = {
+                    .accion = Dir_Parar,
+                    .dur_ms = 0,
+                    .t0_ms = 0
+                };
+
+                switch (estado) {
+                    case EST_LINEA_AVANZAR:
+                        cmd.accion = Dir_Avanzar;
+                        cmd.dur_ms = tiempo_avanzar_ms;
+                        break;
+
+                    case EST_LINEA_RETROCEDER:
+                        cmd.accion = Dir_Retroceder;
+                        cmd.dur_ms = tiempo_retroceder_ms;
+                        break;
+
+                    case EST_LINEA_IZQUIERDA:
+                        cmd.accion = Dir_Izquierda;
+                        cmd.dur_ms = tiempo_izquierda_ms;
+                        break;
+
+                    case EST_LINEA_DERECHA:
+                        cmd.accion = Dir_Derecha;
+                        cmd.dur_ms = tiempo_derecha_ms;
+                        break;
+
+                    default:
+                        cmd.accion = Dir_Parar;
+                        cmd.dur_ms = 0;
+                        break;
+                }
+
+                if (motorCmdQ) {
+                    xQueueSend(motorCmdQ, &cmd, 0);
+                }
+            }
+
+            cJSON *msg = cJSON_CreateObject();
+            if (msg) {
+                cJSON_AddStringToObject(msg, "tipo", "linea_estado");
+                cJSON_AddNumberToObject(msg, "a1", a1);
+                cJSON_AddNumberToObject(msg, "a2", a2);
+                cJSON_AddNumberToObject(msg, "a3", a3);
+                cJSON_AddNumberToObject(msg, "a4", a4);
+                cJSON_AddStringToObject(msg, "estado", estado_linea_str(estado));
+                cJSON_AddBoolToObject(msg, "activo", siguelineas_auto);
+                broadcast_json(msg);
+                cJSON_Delete(msg);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(tiempo_estado_ms));
+    }
 }
 
 // ==================== APP MAIN ====================
@@ -610,6 +801,8 @@ ESP_ERROR_CHECK(gpio_config(&io_siguelineas));
     // Task de motores
     motorCmdQ = xQueueCreate(5, sizeof(CmdMotor));
     xTaskCreatePinnedToCore(MotorTask, "MotorTask", 4096, NULL, 1, NULL, 1);
+
+    xTaskCreatePinnedToCore(LineaTask, "LineaTask", 4096, NULL, 1, NULL, 1);
 
     // HTTPD + WS
     start_server();
