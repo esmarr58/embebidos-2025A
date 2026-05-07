@@ -449,6 +449,20 @@ static esp_err_t ws_handler(httpd_req_t *req) {
                     send_json_to_fd(fd, ack2);
                     cJSON_Delete(ack2);
                 }
+                } else if (tipo && strcmp(tipo, "leer_linea") == 0) {
+                        int a1, a2, a3, a4;
+                        leer_siguelineas(&a1, &a2, &a3, &a4);
+                    
+                        cJSON *resp = cJSON_CreateObject();
+                        cJSON_AddStringToObject(resp, "tipo", "linea_lectura");
+                        cJSON_AddNumberToObject(resp, "a1", a1);
+                        cJSON_AddNumberToObject(resp, "a2", a2);
+                        cJSON_AddNumberToObject(resp, "a3", a3);
+                        cJSON_AddNumberToObject(resp, "a4", a4);
+                        send_json_to_fd(fd, resp);
+                        cJSON_Delete(resp);
+                 }    
+                                    
                 cJSON_Delete(root);
             }
         }
@@ -490,6 +504,9 @@ static void telemetria_cb(void *arg) {
     actualizarLecturaDHT(false);
     int adc = adc_read_raw();
 
+    int a1, a2, a3, a4;
+    leer_siguelineas(&a1, &a2, &a3, &a4);
+
     cJSON *msg = cJSON_CreateObject();
     cJSON_AddStringToObject(msg, "tipo", "telemetria");
     cJSON_AddNumberToObject(msg, "adc", adc);
@@ -497,6 +514,10 @@ static void telemetria_cb(void *arg) {
     cJSON_AddNumberToObject(msg, "humedad", hum_cache);
     cJSON_AddBoolToObject(msg, "dht_ok", dht_ok);
     cJSON_AddNumberToObject(msg, "tiempo_ms", (double)millis32());
+    cJSON_AddNumberToObject(msg, "linea_a1", a1);
+    cJSON_AddNumberToObject(msg, "linea_a2", a2);
+    cJSON_AddNumberToObject(msg, "linea_a3", a3);
+    cJSON_AddNumberToObject(msg, "linea_a4", a4);
     broadcast_json(msg);
     cJSON_Delete(msg);
 }
