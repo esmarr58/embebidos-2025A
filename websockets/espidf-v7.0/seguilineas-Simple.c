@@ -1,27 +1,37 @@
 #include <stdio.h>
+#include <stdbool.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 
 // ==================== PINES ====================
 // Sensores siguelíneas
-#define S1 18   // Izquierda extrema
-#define S2 17   // Izquierda centro
-#define S3 16   // Derecha centro
-#define S4 15   // Derecha extrema
+#define S1 18
+#define S2 17
+#define S3 16
+#define S4 15
 
 // Motores con L298N
-#define IN1 11  // Motor A
+#define IN1 11
 #define IN2 12
-#define IN3 13  // Motor B
+#define IN3 13
 #define IN4 14
 
 // Tiempo entre lecturas
 #define TIEMPO_LECTURA_MS 300
 
+// Si está en false, NO se mueven los motores
+static bool MOTORES_HABILITADOS = false;
+
 // ==================== MOVIMIENTOS ====================
 
 void motores_parar(void) {
+    if (!MOTORES_HABILITADOS) {
+        printf("[DEBUG] Motores deshabilitados -> PARAR\n");
+        return;
+    }
+
     gpio_set_level(IN1, 0);
     gpio_set_level(IN2, 0);
     gpio_set_level(IN3, 0);
@@ -29,6 +39,11 @@ void motores_parar(void) {
 }
 
 void avanzar(void) {
+    if (!MOTORES_HABILITADOS) {
+        printf("[DEBUG] Motores deshabilitados -> AVANZAR\n");
+        return;
+    }
+
     gpio_set_level(IN1, 1);
     gpio_set_level(IN2, 0);
     gpio_set_level(IN3, 1);
@@ -36,6 +51,11 @@ void avanzar(void) {
 }
 
 void retroceder(void) {
+    if (!MOTORES_HABILITADOS) {
+        printf("[DEBUG] Motores deshabilitados -> RETROCEDER\n");
+        return;
+    }
+
     gpio_set_level(IN1, 0);
     gpio_set_level(IN2, 1);
     gpio_set_level(IN3, 0);
@@ -43,6 +63,11 @@ void retroceder(void) {
 }
 
 void girar_izquierda(void) {
+    if (!MOTORES_HABILITADOS) {
+        printf("[DEBUG] Motores deshabilitados -> GIRAR IZQUIERDA\n");
+        return;
+    }
+
     gpio_set_level(IN1, 0);
     gpio_set_level(IN2, 1);
     gpio_set_level(IN3, 1);
@@ -50,6 +75,11 @@ void girar_izquierda(void) {
 }
 
 void girar_derecha(void) {
+    if (!MOTORES_HABILITADOS) {
+        printf("[DEBUG] Motores deshabilitados -> GIRAR DERECHA\n");
+        return;
+    }
+
     gpio_set_level(IN1, 1);
     gpio_set_level(IN2, 0);
     gpio_set_level(IN3, 0);
@@ -59,7 +89,6 @@ void girar_derecha(void) {
 // ==================== CONFIGURACIÓN DE GPIO ====================
 
 void configurar_pines(void) {
-    // Pines de motores como salida
     gpio_config_t motores = {
         .pin_bit_mask = (1ULL << IN1) |
                         (1ULL << IN2) |
@@ -72,7 +101,6 @@ void configurar_pines(void) {
     };
     gpio_config(&motores);
 
-    // Pines de sensores como entrada
     gpio_config_t sensores = {
         .pin_bit_mask = (1ULL << S1) |
                         (1ULL << S2) |
@@ -85,7 +113,10 @@ void configurar_pines(void) {
     };
     gpio_config(&sensores);
 
-    motores_parar();
+    gpio_set_level(IN1, 0);
+    gpio_set_level(IN2, 0);
+    gpio_set_level(IN3, 0);
+    gpio_set_level(IN4, 0);
 }
 
 // ==================== LECTURA DE SENSORES ====================
@@ -107,30 +138,32 @@ void algoritmo_siguelineas(void) {
     printf("\nSensores: S1=%d  S2=%d  S3=%d  S4=%d\n", s1, s2, s3, s4);
 
     /*
-        Suposición usada:
-
-        0 = sensor detecta línea negra
-        1 = sensor detecta fondo blanco
-
-        S1 = izquierda extrema
-        S2 = izquierda centro
-        S3 = derecha centro
-        S4 = derecha extrema
+        Corrección:
+        1 = sensor detecta línea negra
+        0 = sensor detecta fondo blanco
     */
 
-    if (s2 == 0 && s3 == 0) {
+    if (s2 == 1 && s3 == 1) {
         printf("Linea centrada -> AVANZAR\n");
         avanzar();
     }
-    else if (s1 == 0 || s2 == 0) {
+    else if (s1 == 1 && s2 == 1) {
+        printf("Linea muy hacia la izquierda -> GIRAR IZQUIERDA\n");
+        girar_izquierda();
+    }
+    else if (s3 == 1 && s4 == 1) {
+        printf("Linea muy hacia la derecha -> GIRAR DERECHA\n");
+        girar_derecha();
+    }
+    else if (s1 == 1 || s2 == 1) {
         printf("Linea hacia la izquierda -> GIRAR IZQUIERDA\n");
         girar_izquierda();
     }
-    else if (s3 == 0 || s4 == 0) {
+    else if (s3 == 1 || s4 == 1) {
         printf("Linea hacia la derecha -> GIRAR DERECHA\n");
         girar_derecha();
     }
-    else if (s1 == 1 && s2 == 1 && s3 == 1 && s4 == 1) {
+    else if (s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0) {
         printf("Linea perdida -> RETROCEDER\n");
         retroceder();
     }
@@ -148,6 +181,13 @@ void app_main(void) {
     configurar_pines();
 
     printf("Pines configurados correctamente.\n");
+
+    if (MOTORES_HABILITADOS) {
+        printf("Motores habilitados: el robot se movera.\n");
+    } else {
+        printf("Motores deshabilitados: solo modo prueba/debug.\n");
+    }
+
     printf("Iniciando lectura de sensores...\n");
 
     while (1) {
