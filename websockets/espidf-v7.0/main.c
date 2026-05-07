@@ -46,12 +46,12 @@
 #define PIN_LED 44
 
 // WiFi (ajusta a tu red)
-static const char *WIFI_SSID = "GWN571D04";
+static const char *WIFI_SSID = "GWN571D045";
 static const char *WIFI_PASS = "ESP32CUCEI$$";
 
 // WebSocket en puerto 81 y ruta /ws
-#define WS_PORT 81
-#define WS_URI  "/ws"
+#define WS_PORT 80
+#define WS_URI  "/"
 
 // ADC: ESP32-S3 GPIO4 -> ADC1_CHANNEL_3
 #define ADC_GPIO          4
